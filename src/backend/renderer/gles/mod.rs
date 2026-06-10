@@ -911,7 +911,11 @@ impl ImportMemWl for GlesRenderer {
                         ptr.offset(offset as isize) as *const _,
                     );
                 } else {
-                    for region in damage.iter() {
+                    // Damage accumulates across commits (`damage_since`), so rects from
+                    // an older, larger buffer can exceed the current size; unclamped, they
+                    // fail the whole upload with GL_INVALID_VALUE and leave stale contents.
+                    let buffer_rect = Rectangle::from_size(Size::from((width, height)));
+                    for region in damage.iter().filter_map(|r| r.intersection(buffer_rect)) {
                         trace!("Uploading partial shm texture");
                         self.gl.PixelStorei(ffi::UNPACK_SKIP_PIXELS, region.loc.x);
                         self.gl.PixelStorei(ffi::UNPACK_SKIP_ROWS, region.loc.y);
