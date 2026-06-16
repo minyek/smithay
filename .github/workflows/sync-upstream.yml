@@ -1,0 +1,21 @@
+name: Sync fork with upstream
+
+on:
+  schedule:
+    - cron: '0 6 * * *'   # daily at 06:00 UTC (cron is UTC; runs are best-effort)
+  workflow_dispatch: {}    # also lets you trigger it by hand from the Actions tab
+
+permissions:
+  contents: write          # GITHUB_TOKEN needs this to update the branch
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fast-forward master to upstream
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api --method POST \
+            repos/${{ github.repository }}/merge-upstream \
+            -f branch=master
