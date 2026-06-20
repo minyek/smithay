@@ -212,7 +212,10 @@ where
             Ok(dmabuf) => dmabuf,
             Err(err) => return Err((swapchain.allocator, err.into())),
         };
-        buffer.userdata().insert_if_missing(|| fb);
+        // Cache thread-safely: a framebuffer dropped off its creating thread must
+        // still run its `Drop` (`destroy_framebuffer`) to release the DRM framebuffer
+        // and the kernel buffer reference it holds.
+        buffer.userdata().insert_if_missing_threadsafe(|| fb);
 
         let handle = buffer.userdata().get::<GbmFramebuffer>().unwrap();
 
@@ -266,7 +269,9 @@ where
             if maybe_buffer.is_none() {
                 let fb = framebuffer_from_bo(self.drm.device_fd(), &slot, self.is_opaque)
                     .map_err(|err| Error::DrmError(err.into()))?;
-                slot.userdata().insert_if_missing(|| fb);
+                // Thread-safe cache, as in `add_framebuffer`: a framebuffer dropped off
+                // its creating thread must not leak.
+                slot.userdata().insert_if_missing_threadsafe(|| fb);
             }
 
             self.next_fb = Some(slot);

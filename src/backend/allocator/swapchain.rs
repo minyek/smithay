@@ -118,7 +118,12 @@ impl<B: Buffer + AsDmabuf> AsDmabuf for Slot<B> {
         let maybe_dmabuf = self.userdata().get::<Dmabuf>();
         if maybe_dmabuf.is_none() {
             let dmabuf = (**self).export()?;
-            self.userdata().insert_if_missing(|| dmabuf);
+            // Cache thread-safely: a slot exported on one thread (e.g. the main
+            // renderer during a reconfigure) may be dropped on another, and the
+            // non-thread-safe `UserData` leaks values dropped off their creating
+            // thread — orphaning the cached `Dmabuf`'s `Arc` and pinning its GBM
+            // buffer for the process lifetime.
+            self.userdata().insert_if_missing_threadsafe(|| dmabuf);
         }
 
         Ok(self.userdata().get::<Dmabuf>().cloned().unwrap())
