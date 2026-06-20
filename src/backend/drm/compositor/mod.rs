@@ -625,6 +625,18 @@ impl<B: Buffer, F: Framebuffer> FrameState<B, F> {
         self.plane_state(handle)
             .and_then(|state| state.config.as_ref().map(|config| &config.buffer))
     }
+
+    /// VRAM-leak instrumentation: the debug-id of the swapchain slot bound to the
+    /// primary plane in this frame state, if any. Used to tell whether a retained
+    /// frame strands an old-generation render target.
+    fn debug_primary_swapchain_id(&self, primary: plane::Handle) -> Option<u64> {
+        let config = self.plane_state(primary)?.config.as_ref()?;
+        if let ScanoutBuffer::Swapchain(slot) = &config.buffer.buffer {
+            slot.userdata().get::<Dmabuf>().map(|d| d.debug_id())
+        } else {
+            None
+        }
+    }
 }
 
 impl<B: Buffer, F: Framebuffer> FrameState<B, F> {
@@ -2798,6 +2810,44 @@ where
         self.primary_is_opaque = is_oapque;
 
         Ok(())
+    }
+
+    /// VRAM-leak instrumentation: the dmabuf debug-ids currently referenced by this
+    /// compositor's swapchain slots and each retained frame state
+    /// (`current`/`pending`/`queued`/`next`). Cross-referenced against the main
+    /// renderer's `dmabuf_cache` report, this distinguishes current-generation
+    /// render targets from stranded old generations and names the retainer.
+    pub fn debug_slot_ids_string(&self) -> String {
+        let primary = self.surface.plane();
+        let swapchain = self
+            .swapchain
+            .debug_slot_dmabuf_ids()
+            .into_iter()
+            .map(|id| id.map(|v| v.to_string()).unwrap_or_else(|| "-".into()))
+            .collect::<Vec<_>>()
+            .join(",");
+        let fmt = |id: Option<u64>| id.map(|v| v.to_string()).unwrap_or_else(|| "-".into());
+        let current = self.current_frame.debug_primary_swapchain_id(primary);
+        let pending = self
+            .pending_frame
+            .as_ref()
+            .and_then(|p| p.frame.debug_primary_swapchain_id(primary));
+        let queued = self
+            .queued_frame
+            .as_ref()
+            .and_then(|q| q.prepared_frame.frame.debug_primary_swapchain_id(primary));
+        let next = self
+            .next_frame
+            .as_ref()
+            .and_then(|n| n.frame.debug_primary_swapchain_id(primary));
+        format!(
+            "swapchain=[{}] current={} pending={} queued={} next={}",
+            swapchain,
+            fmt(current),
+            fmt(pending),
+            fmt(queued),
+            fmt(next),
+        )
     }
 
     /// Change the output mode source.

@@ -1,9 +1,10 @@
 use std::{
+    collections::BTreeMap,
     fmt,
     ops::Deref,
     sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicU8, Ordering},
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering},
     },
 };
 
@@ -15,6 +16,115 @@ use crate::utils::user_data::UserDataMap;
 use super::dmabuf::{AsDmabuf, Dmabuf};
 
 pub const SLOT_CAP: usize = 4;
+
+// --- VRAM-leak diagnostic: live-slot registry --------------------------------
+// Every `InternalSlot` that gets a buffer allocated registers here, keyed by a
+// process-unique id, and deregisters on `Drop`. A slot whose owning `Swapchain`
+// was replaced (set_format / resize) yet stays registered is held by an escaped
+// `Slot` clone — the residual full-screen render-target leak. The recorded
+// acquire backtrace names the render path that allocated it.
+static SLOT_UID: AtomicUsize = AtomicUsize::new(0);
+
+struct LiveSlot {
+    width: i32,
+    height: i32,
+    dmabuf_id: Option<u64>,
+    acquired_at: String,
+}
+
+static LIVE_SLOTS: Mutex<BTreeMap<usize, LiveSlot>> = Mutex::new(BTreeMap::new());
+
+/// Per-size summary of every live (never-dropped) swapchain slot that has had a
+/// buffer allocated, for the VRAM-leak census. A size group whose count exceeds
+/// the live swapchains' `SLOT_CAP` × output count names stranded render targets.
+pub fn debug_live_slots() -> String {
+    let map = match LIVE_SLOTS.lock() {
+        Ok(m) => m,
+        Err(_) => return "live_slots: <poisoned>".into(),
+    };
+    let mut by_size: BTreeMap<(i32, i32), Vec<String>> = BTreeMap::new();
+    for slot in map.values() {
+        let id = slot
+            .dmabuf_id
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "?".into());
+        by_size
+            .entry((slot.width, slot.height))
+            .or_default()
+            .push(id);
+    }
+    let parts = by_size
+        .into_iter()
+        .map(|((w, h), mut ids)| {
+            ids.sort();
+            format!("{w}x{h}×{} [{}]", ids.len(), ids.join(","))
+        })
+        .collect::<Vec<_>>();
+    format!("live_slots total={} {{{}}}", map.len(), parts.join("; "))
+}
+
+/// Live slots grouped by their acquire-path signature, for drilling into *which*
+/// render path stranded them once the census flags a leak.
+pub fn debug_live_slot_sites() -> String {
+    let map = match LIVE_SLOTS.lock() {
+        Ok(m) => m,
+        Err(_) => return "live_slot_sites: <poisoned>".into(),
+    };
+    let mut by_site: BTreeMap<String, usize> = BTreeMap::new();
+    for slot in map.values() {
+        *by_site.entry(slot.acquired_at.clone()).or_default() += 1;
+    }
+    let mut parts = by_site.into_iter().collect::<Vec<_>>();
+    parts.sort_by(|a, b| b.1.cmp(&a.1));
+    parts
+        .into_iter()
+        .map(|(site, n)| format!("{n}× {site}"))
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
+/// Reduce a full backtrace to the cosmic-comp / smithay-drm frames that identify
+/// the acquire path, as a single `a <- b <- c` line.
+fn acquire_signature() -> String {
+    let text = std::backtrace::Backtrace::force_capture().to_string();
+    let mut frames: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        let relevant = line.contains("cosmic_comp::backend::kms")
+            || line.contains("drm::output")
+            || line.contains("drm::compositor")
+            || line.contains("allow_frame_flags")
+            || line.contains("apply_config")
+            || line.contains("initialize_output")
+            || line.contains("use_mode")
+            || line.contains("try_to_restore")
+            || line.contains("submit_composited_frame");
+        if !relevant {
+            continue;
+        }
+        let sym = line.split_once(": ").map(|(_, s)| s).unwrap_or(line);
+        let sym = sym.split("::h").next().unwrap_or(sym);
+        let short = sym
+            .rsplit("::")
+            .take(2)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>()
+            .join("::");
+        if !short.is_empty() && !frames.contains(&short) {
+            frames.push(short);
+        }
+        if frames.len() >= 5 {
+            break;
+        }
+    }
+    if frames.is_empty() {
+        "<other>".into()
+    } else {
+        frames.join(" <- ")
+    }
+}
 
 /// Swapchain handling a fixed set of re-usable buffers e.g. for scan-out.
 ///
@@ -79,6 +189,15 @@ struct InternalSlot<B: Buffer> {
     acquired: AtomicBool,
     age: AtomicU8,
     userdata: UserDataMap,
+    uid: usize,
+}
+
+impl<B: Buffer> Drop for InternalSlot<B> {
+    fn drop(&mut self) {
+        if let Ok(mut map) = LIVE_SLOTS.lock() {
+            map.remove(&self.uid);
+        }
+    }
 }
 
 impl<B: Buffer> Slot<B> {
@@ -100,6 +219,7 @@ impl<B: Buffer> Default for InternalSlot<B> {
             acquired: AtomicBool::new(false),
             age: AtomicU8::new(0),
             userdata: UserDataMap::new(),
+            uid: SLOT_UID.fetch_add(1, Ordering::Relaxed),
         }
     }
 }
@@ -121,7 +241,15 @@ impl<B: Buffer + AsDmabuf> AsDmabuf for Slot<B> {
             self.userdata().insert_if_missing_threadsafe(|| dmabuf);
         }
 
-        Ok(self.userdata().get::<Dmabuf>().cloned().unwrap())
+        let dmabuf = self.userdata().get::<Dmabuf>().cloned().unwrap();
+        // Link this slot's diagnostic registry entry to its exported dmabuf id so
+        // the census can cross-reference orphans against the main renderer cache.
+        if let Ok(mut map) = LIVE_SLOTS.lock() {
+            if let Some(entry) = map.get_mut(&self.0.uid) {
+                entry.dmabuf_id = Some(dmabuf.debug_id());
+            }
+        }
+        Ok(dmabuf)
     }
 }
 
@@ -171,7 +299,21 @@ where
                     .allocator
                     .create_buffer(self.width, self.height, self.fourcc, &self.modifiers)
                 {
-                    Ok(buffer) => free_slot.buffer = Some(buffer),
+                    Ok(buffer) => {
+                        let size = buffer.size();
+                        if let Ok(mut map) = LIVE_SLOTS.lock() {
+                            map.insert(
+                                free_slot.uid,
+                                LiveSlot {
+                                    width: size.w,
+                                    height: size.h,
+                                    dmabuf_id: None,
+                                    acquired_at: acquire_signature(),
+                                },
+                            );
+                        }
+                        free_slot.buffer = Some(buffer);
+                    }
                     Err(err) => {
                         free_slot.acquired.store(false, Ordering::SeqCst);
                         return Err(err);
@@ -248,6 +390,16 @@ where
                 None => *slot = Default::default(),
             }
         }
+    }
+
+    /// VRAM-leak instrumentation: the debug-id of each slot's exported dmabuf, or
+    /// `None` for slots that have not been exported. Lets the census map a cached
+    /// render-target import back to a live swapchain slot.
+    pub fn debug_slot_dmabuf_ids(&self) -> Vec<Option<u64>> {
+        self.slots
+            .iter()
+            .map(|slot| slot.userdata.get::<Dmabuf>().map(|d| d.debug_id()))
+            .collect()
     }
 
     /// Get set format

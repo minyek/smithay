@@ -161,6 +161,24 @@ impl GlowRenderer {
         }
         Ok(func(&self.glow))
     }
+
+    /// Number of imported client dmabufs the underlying [`GlesRenderer`] caches,
+    /// for VRAM-leak localisation; see [`GlesRenderer::debug_dmabuf_cache_len`].
+    pub fn debug_dmabuf_cache_len(&self) -> usize {
+        self.gl.as_ref().debug_dmabuf_cache_len()
+    }
+
+    /// Per-entry dmabuf-cache report of the underlying [`GlesRenderer`], for
+    /// VRAM-leak localisation; see [`GlesRenderer::debug_dmabuf_cache_report`].
+    pub fn debug_dmabuf_cache_report(&self) -> (Vec<(i32, i32, u64, usize, String)>, usize) {
+        self.gl.as_ref().debug_dmabuf_cache_report()
+    }
+
+    /// Alive-cache dmabuf heap pointers of the underlying [`GlesRenderer`], for
+    /// core-dump holder localisation; see [`GlesRenderer::debug_dmabuf_cache_ptrs`].
+    pub fn debug_dmabuf_cache_ptrs(&self) -> Vec<(u64, i32, i32, usize)> {
+        self.gl.as_ref().debug_dmabuf_cache_ptrs()
+    }
 }
 
 impl GlowFrame<'_, '_> {

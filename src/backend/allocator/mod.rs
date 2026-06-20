@@ -33,7 +33,7 @@ use std::{
 };
 
 use crate::utils::{Buffer as BufferCoords, Size};
-pub use swapchain::{Slot, Swapchain};
+pub use swapchain::{Slot, Swapchain, debug_live_slot_sites, debug_live_slots};
 
 pub use drm_fourcc::{
     DrmFormat as Format, DrmFourcc as Fourcc, DrmModifier as Modifier, DrmVendor as Vendor,

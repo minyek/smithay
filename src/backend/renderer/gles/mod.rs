@@ -22,6 +22,7 @@ use std::{
 };
 use tracing::{Level, debug, error, info, info_span, instrument, span, span::EnteredSpan, trace, warn};
 
+pub(crate) mod debug_counters;
 pub mod element;
 mod error;
 pub mod format;
@@ -31,6 +32,7 @@ mod texture;
 mod uniform;
 mod version;
 
+pub use debug_counters::{VramCounters, vram_counters};
 pub use error::*;
 use format::*;
 pub use shaders::*;
@@ -152,6 +154,7 @@ impl GlesRenderbuffer {
 
 impl Drop for GlesRenderbufferInternal {
     fn drop(&mut self) {
+        debug_counters::queued_renderbuffer();
         let _ = self
             .destruction_callback_sender
             .send(CleanupResource::RenderbufferObject(self.rbo));
@@ -269,9 +272,11 @@ impl Drop for GlesTargetInternal<'_> {
                 destruction_callback_sender,
                 ..
             } => {
+                debug_counters::queued_framebuffer();
                 let _ = destruction_callback_sender.send(CleanupResource::FramebufferObject(*fbo));
             }
             GlesTargetInternal::Renderbuffer { buf, fbo, .. } => {
+                debug_counters::queued_framebuffer();
                 let _ = buf
                     .0
                     .destruction_callback_sender
@@ -339,18 +344,28 @@ impl GlesCleanup {
         for resource in receiver.try_iter() {
             match resource {
                 CleanupResource::Texture(texture) => unsafe {
+                    debug_counters::drained_texture();
+                    debug_counters::texture_destroyed();
                     gl.DeleteTextures(1, &texture);
                 },
                 CleanupResource::EGLImage(image) => unsafe {
+                    debug_counters::drained_egl_image();
+                    debug_counters::egl_image_destroyed();
                     ffi_egl::DestroyImageKHR(**egl.display().get_display_handle(), image);
                 },
                 CleanupResource::FramebufferObject(fbo) => unsafe {
+                    debug_counters::drained_framebuffer();
+                    debug_counters::framebuffer_destroyed();
                     gl.DeleteFramebuffers(1, &fbo);
                 },
                 CleanupResource::RenderbufferObject(rbo) => unsafe {
+                    debug_counters::drained_renderbuffer();
+                    debug_counters::renderbuffer_destroyed();
                     gl.DeleteRenderbuffers(1, &rbo);
                 },
                 CleanupResource::Mapping(pbo, mapping) => unsafe {
+                    debug_counters::drained_mapping();
+                    debug_counters::buffer_destroyed();
                     if !mapping.is_null() {
                         gl.BindBuffer(ffi::PIXEL_PACK_BUFFER, pbo);
                         gl.UnmapBuffer(ffi::PIXEL_PACK_BUFFER);
@@ -359,9 +374,11 @@ impl GlesCleanup {
                     gl.DeleteBuffers(1, &pbo);
                 },
                 CleanupResource::Program(program) => unsafe {
+                    debug_counters::drained_program();
                     gl.DeleteProgram(program);
                 },
                 CleanupResource::Sync(sync) => unsafe {
+                    debug_counters::drained_sync();
                     gl.DeleteSync(sync);
                 },
             }
@@ -693,6 +710,9 @@ impl GlesRenderer {
 
         let mut vbos = [0; 2];
         gl.GenBuffers(vbos.len() as i32, vbos.as_mut_ptr());
+        for _ in 0..vbos.len() {
+            debug_counters::buffer_created();
+        }
         gl.BindBuffer(ffi::ARRAY_BUFFER, vbos[0]);
         gl.BufferData(
             ffi::ARRAY_BUFFER,
@@ -762,6 +782,7 @@ impl GlesRenderer {
             unsafe {
                 sync_lock.wait_for_all(&self.gl);
                 self.gl.GenFramebuffers(1, &mut fbo as *mut _);
+                debug_counters::framebuffer_created();
                 self.gl.BindFramebuffer(ffi::FRAMEBUFFER, fbo);
                 self.gl.FramebufferTexture2D(
                     ffi::READ_FRAMEBUFFER,
@@ -782,6 +803,7 @@ impl GlesRenderer {
 
                 if status != ffi::FRAMEBUFFER_COMPLETE {
                     self.gl.DeleteFramebuffers(1, &mut fbo as *mut _);
+                    debug_counters::framebuffer_destroyed();
                     return Err(GlesError::FramebufferBindingError);
                 }
             }
@@ -821,6 +843,61 @@ impl GlesRenderer {
         self.dmabuf_cache.retain(|entry, _tex| !entry.is_gone());
         self.buffers.retain(|buffer| !buffer.0.dmabuf.is_gone());
         self.gles_cleanup().cleanup(&self.egl, &self.gl);
+    }
+
+    /// Number of imported client dmabufs this renderer currently caches, each
+    /// owning a [`GlesTexture`] and its `EGLImage`, for VRAM-leak localisation.
+    ///
+    /// The process-global lifecycle counters cannot say *which* renderer
+    /// instance a leak lives in; this per-instance length can. A length that
+    /// grows without bound names the leaking renderer. (Since dmabuf render
+    /// targets are now bound as textures, this cache holds both client textures
+    /// and render-target imports.)
+    pub fn debug_dmabuf_cache_len(&self) -> usize {
+        self.dmabuf_cache.len()
+    }
+
+    /// VRAM-leak instrumentation: per-entry report of the dmabuf import cache. For
+    /// every ALIVE entry returns `(width, height, dmabuf debug-id, external
+    /// strong-count)` — the strong-count excludes the temporary upgrade handle
+    /// held here, so it is the number of other live holders of the source dmabuf.
+    /// The trailing `usize` is the count of dead (`is_gone`) entries still awaiting
+    /// eviction. A render-target-sized entry whose source dmabuf is still strongly
+    /// held names a leak.
+    pub fn debug_dmabuf_cache_report(&self) -> (Vec<(i32, i32, u64, usize, String)>, usize) {
+        use crate::backend::allocator::Buffer;
+        let mut alive = Vec::new();
+        let mut dead = 0usize;
+        for (weak, _tex) in self.dmabuf_cache.iter() {
+            if let Some(dmabuf) = weak.upgrade() {
+                let size = dmabuf.size();
+                alive.push((
+                    size.w,
+                    size.h,
+                    dmabuf.debug_id(),
+                    dmabuf.debug_strong_count().saturating_sub(1),
+                    dmabuf.debug_created_at().to_string(),
+                ));
+            } else {
+                dead += 1;
+            }
+        }
+        (alive, dead)
+    }
+
+    /// VRAM-leak instrumentation: `(dmabuf_id, w, h, arc_data_ptr)` for every alive
+    /// cache entry, so a core dump can be searched for the strong holder of a
+    /// leaked render-target dmabuf.
+    pub fn debug_dmabuf_cache_ptrs(&self) -> Vec<(u64, i32, i32, usize)> {
+        use crate::backend::allocator::Buffer;
+        let mut out = Vec::new();
+        for (weak, _tex) in self.dmabuf_cache.iter() {
+            if let Some(dmabuf) = weak.upgrade() {
+                let size = dmabuf.size();
+                out.push((dmabuf.debug_id(), size.w, size.h, dmabuf.debug_ptr()));
+            }
+        }
+        out
     }
 
     /// Returns the supported [`Capabilities`](Capability) of this renderer.
@@ -921,6 +998,7 @@ impl ImportMemWl for GlesRenderer {
                         unsafe { self.gl.GenTextures(1, &mut tex) };
                         // new texture, upload in full
                         upload_full = true;
+                        debug_counters::texture_created();
                         let new = Arc::new(GlesTextureInternal {
                             texture: tex,
                             sync: RwLock::default(),
@@ -1091,6 +1169,7 @@ impl ImportMem for GlesRenderer {
             };
 
             // new texture, upload in full
+            debug_counters::texture_created();
             GlesTextureInternal {
                 texture: tex,
                 sync,
@@ -1232,6 +1311,7 @@ impl ImportEgl for GlesRenderer {
 
         let tex = self.import_egl_image(egl.image(0).unwrap(), egl.format == EGLFormat::External, None)?;
 
+        debug_counters::texture_created();
         let texture = GlesTexture(Arc::new(GlesTextureInternal {
             texture: tex,
             sync: RwLock::default(),
@@ -1286,6 +1366,7 @@ impl ImportDma for GlesRenderer {
                 .map(|(internal, _, _)| internal)
                 .unwrap_or(ffi::RGBA8);
             let has_alpha = has_alpha(buffer.format().code);
+            debug_counters::texture_created();
             let texture = GlesTexture(Arc::new(GlesTextureInternal {
                 texture: tex,
                 sync: RwLock::default(),
@@ -1383,6 +1464,7 @@ impl ExportMem for GlesRenderer {
         let err = unsafe {
             self.gl.GetError(); // clear errors
             self.gl.GenBuffers(1, &mut pbo);
+            debug_counters::buffer_created();
             self.gl.BindBuffer(ffi::PIXEL_PACK_BUFFER, pbo);
             let size = (region.size.w * region.size.h * bpp as i32) as isize;
             self.gl
@@ -1419,6 +1501,7 @@ impl ExportMem for GlesRenderer {
             }),
             err => {
                 unsafe { self.gl.DeleteBuffers(1, &pbo) };
+                debug_counters::buffer_destroyed();
                 Err(if matches!(err, ffi::INVALID_ENUM | ffi::INVALID_OPERATION) {
                     GlesError::UnsupportedPixelFormat(fourcc)
                 } else {
@@ -1451,6 +1534,7 @@ impl ExportMem for GlesRenderer {
         let err = unsafe {
             self.gl.GetError(); // clear errors
             self.gl.GenBuffers(1, &mut pbo);
+            debug_counters::buffer_created();
             self.gl.BindBuffer(ffi::PIXEL_PACK_BUFFER, pbo);
             self.gl.BufferData(
                 ffi::PIXEL_PACK_BUFFER,
@@ -1485,6 +1569,7 @@ impl ExportMem for GlesRenderer {
             }),
             err => {
                 unsafe { self.gl.DeleteBuffers(1, &pbo) };
+                debug_counters::buffer_destroyed();
                 Err(if matches!(err, ffi::INVALID_ENUM | ffi::INVALID_OPERATION) {
                     GlesError::UnsupportedPixelFormat(fourcc)
                 } else {
@@ -1648,6 +1733,7 @@ impl Bind<GlesRenderbuffer> for GlesRenderer {
             let mut fbo = 0;
             unsafe {
                 self.gl.GenFramebuffers(1, &mut fbo as *mut _);
+                debug_counters::framebuffer_created();
                 self.gl.BindFramebuffer(ffi::FRAMEBUFFER, fbo);
                 self.gl.BindRenderbuffer(ffi::RENDERBUFFER, renderbuffer.0.rbo);
                 self.gl.FramebufferRenderbuffer(
@@ -1662,6 +1748,7 @@ impl Bind<GlesRenderbuffer> for GlesRenderer {
 
                 if status != ffi::FRAMEBUFFER_COMPLETE {
                     self.gl.DeleteFramebuffers(1, &mut fbo as *mut _);
+                    debug_counters::framebuffer_destroyed();
                     return Err(GlesError::FramebufferBindingError);
                 }
             }
@@ -1744,6 +1831,7 @@ impl Offscreen<GlesRenderbuffer> for GlesRenderer {
 
             let mut rbo = 0;
             self.gl.GenRenderbuffers(1, &mut rbo);
+            debug_counters::renderbuffer_created();
             self.gl.BindRenderbuffer(ffi::RENDERBUFFER, rbo);
             self.gl
                 .RenderbufferStorage(ffi::RENDERBUFFER, internal, size.w, size.h);
@@ -1912,6 +2000,9 @@ impl Drop for GlesRenderer {
                 self.gl.BindFramebuffer(ffi::FRAMEBUFFER, 0);
                 self.gl.DeleteProgram(self.solid_program.program);
                 self.gl.DeleteBuffers(self.vbos.len() as i32, self.vbos.as_ptr());
+                for _ in 0..self.vbos.len() {
+                    debug_counters::buffer_destroyed();
+                }
 
                 self.profiler.cleanup(Some(&self.gl));
 

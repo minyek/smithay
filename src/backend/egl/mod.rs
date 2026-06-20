@@ -272,6 +272,8 @@ impl Drop for EGLBuffer {
             unsafe {
                 ffi::egl::DestroyImageKHR(**self.display, image);
             }
+            #[cfg(feature = "renderer_gl")]
+            crate::backend::renderer::gles::debug_counters::egl_image_destroyed();
         }
     }
 }

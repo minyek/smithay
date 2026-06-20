@@ -27,6 +27,7 @@ impl GlesTexture {
         tex: ffi::types::GLuint,
         size: Size<i32, BufferCoord>,
     ) -> GlesTexture {
+        debug_counters::texture_created();
         GlesTexture(Arc::new(GlesTextureInternal {
             texture: tex,
             sync: RwLock::default(),
@@ -137,22 +138,26 @@ unsafe impl Sync for GlesTextureInternal {}
 
 impl Drop for GlesTextureInternal {
     fn drop(&mut self) {
+        debug_counters::queued_texture();
         let _ = self
             .destruction_callback_sender
             .send(CleanupResource::Texture(self.texture));
         let mut sync = self.sync.write().unwrap();
         if let Some(sync) = sync.read_sync.get_mut().unwrap().take() {
+            debug_counters::queued_sync();
             let _ = self
                 .destruction_callback_sender
                 .send(CleanupResource::Sync(sync as *const _));
         }
         if let Some(sync) = sync.write_sync.get_mut().unwrap().take() {
+            debug_counters::queued_sync();
             let _ = self
                 .destruction_callback_sender
                 .send(CleanupResource::Sync(sync as *const _));
         }
         if let Some(images) = self.egl_images.take() {
             for image in images {
+                debug_counters::queued_egl_image();
                 let _ = self
                     .destruction_callback_sender
                     .send(CleanupResource::EGLImage(image));
@@ -223,6 +228,7 @@ impl TextureMapping for GlesMapping {
 
 impl Drop for GlesMapping {
     fn drop(&mut self) {
+        debug_counters::queued_mapping();
         let _ = self.destruction_callback_sender.send(CleanupResource::Mapping(
             self.pbo,
             self.mapping.load(Ordering::SeqCst),

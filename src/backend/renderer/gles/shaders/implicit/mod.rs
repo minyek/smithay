@@ -1,5 +1,5 @@
 /// OpenGL Shaders
-use crate::backend::renderer::gles::*;
+use crate::backend::renderer::gles::{debug_counters, *};
 
 pub(in super::super) const VERTEX_SHADER: &str = include_str!("./texture.vert");
 pub(in super::super) const FRAGMENT_SHADER: &str = include_str!("./texture.frag");
@@ -65,9 +65,11 @@ impl GlesTexProgram {
 impl Drop for GlesTexProgramInner {
     fn drop(&mut self) {
         for variant in &self.variants {
+            debug_counters::queued_program();
             let _ = self
                 .destruction_callback_sender
                 .send(CleanupResource::Program(variant.normal.program));
+            debug_counters::queued_program();
             let _ = self
                 .destruction_callback_sender
                 .send(CleanupResource::Program(variant.debug.program));
@@ -115,9 +117,11 @@ pub(in super::super) struct GlesPixelProgramInternal {
 
 impl Drop for GlesPixelProgramInner {
     fn drop(&mut self) {
+        debug_counters::queued_program();
         let _ = self
             .destruction_callback_sender
             .send(CleanupResource::Program(self.normal.program));
+        debug_counters::queued_program();
         let _ = self
             .destruction_callback_sender
             .send(CleanupResource::Program(self.debug.program));

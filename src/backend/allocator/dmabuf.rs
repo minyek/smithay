@@ -31,8 +31,132 @@ use std::{error, fmt};
 /// Maximum amount of planes this implementation supports
 pub const MAX_PLANES: usize = 4;
 
+/// VRAM-leak instrumentation: monotonic id stamped onto every `Dmabuf` at
+/// construction so a cached import can be traced back to the swapchain
+/// generation that produced it.
+static DMABUF_DEBUG_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// VRAM-leak instrumentation: reduce the current backtrace to the few frames that
+/// identify where a `Dmabuf` was created — distinguishing a swapchain/render-target
+/// `export()` from a client-buffer import — as a single `a <- b <- c` line.
+fn dmabuf_creation_signature() -> String {
+    let text = std::backtrace::Backtrace::force_capture().to_string();
+    let mut frames: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        let relevant = line.contains("swapchain")
+            || line.contains("::export")
+            || line.contains("import_dmabuf")
+            || line.contains("dmabuf")
+            || line.contains("render_frame")
+            || line.contains("allow_frame_flags")
+            || line.contains("drm::compositor")
+            || line.contains("drm::output")
+            || line.contains("renderer::element::surface")
+            || line.contains("cosmic_comp")
+            || line.contains("WlBuffer")
+            || line.contains("import_buffer");
+        if !relevant {
+            continue;
+        }
+        let sym = line.split_once(": ").map(|(_, s)| s).unwrap_or(line);
+        let sym = sym.split("::h").next().unwrap_or(sym);
+        let short = sym
+            .rsplit("::")
+            .take(2)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>()
+            .join("::");
+        if !short.is_empty() && !frames.contains(&short) {
+            frames.push(short);
+        }
+        if frames.len() >= 6 {
+            break;
+        }
+    }
+    if frames.is_empty() {
+        "<other>".into()
+    } else {
+        frames.join(" <- ")
+    }
+}
+
+/// VRAM-leak instrumentation: per-clone `Dmabuf` backtrace tracking, to name the
+/// escaped clone whose `Drop` never runs. Off unless `COSMIC_DMABUF_TRACE` is set
+/// (default builds pay nothing) and limited to full-output-sized buffers (the
+/// residual leak) so the per-frame clone path stays cheap.
+fn dmabuf_trace_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("COSMIC_DMABUF_TRACE").is_some())
+}
+
+/// Unique per-`Dmabuf`-*value* id (each clone gets its own) used to pair a clone
+/// with its `Drop`. Distinct from `DmabufInternal::debug_id`, which is shared by
+/// every clone of one buffer.
+static DMABUF_CLONE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Live tracked `Dmabuf` values: `clone_id -> (debug_id, creation backtrace)`.
+/// One entry per live clone, so a buffer with `strong_count == 1` has exactly one
+/// surviving entry whose backtrace is the escaped-clone site. The backtrace is an
+/// `Arc` so the census can take a cheap snapshot and symbolise outside the lock.
+#[allow(clippy::type_complexity)]
+fn dmabuf_clone_registry(
+) -> &'static std::sync::Mutex<std::collections::HashMap<u64, (u64, Arc<std::backtrace::Backtrace>)>>
+{
+    static REG: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<u64, (u64, Arc<std::backtrace::Backtrace>)>>,
+    > = std::sync::OnceLock::new();
+    REG.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Assign a fresh per-value clone id and, when tracing this buffer, record where
+/// the clone was made. Returns 0 when not tracking, so `Drop` can skip cheaply.
+fn dmabuf_register_clone(internal: &Arc<DmabufInternal>) -> u64 {
+    if !dmabuf_trace_enabled() || internal.created_at.is_empty() {
+        return 0;
+    }
+    let clone_id = DMABUF_CLONE_ID.fetch_add(1, Ordering::Relaxed);
+    let bt = Arc::new(std::backtrace::Backtrace::force_capture());
+    if let Ok(mut reg) = dmabuf_clone_registry().lock() {
+        reg.insert(clone_id, (internal.debug_id, bt));
+    }
+    clone_id
+}
+
+/// Drop the registry entry for a `Dmabuf` value going away (no-op for id 0).
+fn dmabuf_deregister_clone(clone_id: u64) {
+    if clone_id != 0 {
+        if let Ok(mut reg) = dmabuf_clone_registry().lock() {
+            reg.remove(&clone_id);
+        }
+    }
+}
+
+/// VRAM-leak instrumentation: snapshot of every live tracked `Dmabuf` clone as
+/// `(debug_id, backtrace)`. Empty unless `COSMIC_DMABUF_TRACE` is set. Backtraces
+/// are symbolised outside the registry lock so a census never stalls the
+/// per-frame clone path on symbolisation.
+pub fn debug_dmabuf_clone_sites() -> Vec<(u64, String)> {
+    let entries: Vec<(u64, Arc<std::backtrace::Backtrace>)> = match dmabuf_clone_registry().lock() {
+        Ok(reg) => reg.values().map(|(id, bt)| (*id, bt.clone())).collect(),
+        Err(_) => return Vec::new(),
+    };
+    entries
+        .into_iter()
+        .map(|(debug_id, bt)| (debug_id, bt.to_string()))
+        .collect()
+}
+
 #[derive(Debug)]
 pub(crate) struct DmabufInternal {
+    /// VRAM-leak instrumentation: unique id assigned at construction.
+    pub debug_id: u64,
+    /// VRAM-leak instrumentation: compact creation-path signature (only captured
+    /// for full-output-sized buffers; empty otherwise) so the census can tell a
+    /// stranded render-target `export()` clone from a leaked client import.
+    pub created_at: String,
     /// The submitted planes
     pub planes: Vec<Plane>,
     /// The size of this buffer
@@ -77,9 +201,14 @@ bitflags::bitflags! {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 /// Strong reference to a dmabuf handle
-pub struct Dmabuf(pub(crate) Arc<DmabufInternal>);
+//
+// The second field is a per-value clone id for VRAM-leak instrumentation (see
+// `dmabuf_register_clone`); `Clone`/`Drop` are implemented manually to maintain
+// it. `PartialEq`/`Eq`/`Hash` below intentionally key only on `.0` (the shared
+// `Arc`), so the id never affects buffer identity.
+pub struct Dmabuf(pub(crate) Arc<DmabufInternal>, u64);
 
 #[derive(Debug, Clone)]
 /// Weak reference to a dmabuf handle
@@ -111,6 +240,21 @@ impl Hash for WeakDmabuf {
     #[inline]
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.0.as_ptr().hash(state)
+    }
+}
+
+impl Clone for Dmabuf {
+    #[inline]
+    fn clone(&self) -> Self {
+        let clone_id = dmabuf_register_clone(&self.0);
+        Dmabuf(self.0.clone(), clone_id)
+    }
+}
+
+impl Drop for Dmabuf {
+    #[inline]
+    fn drop(&mut self) {
+        dmabuf_deregister_clone(self.1);
     }
 }
 
@@ -166,12 +310,20 @@ impl DmabufBuilder {
     /// Build a `Dmabuf` out of the provided parameters and planes
     ///
     /// Returns `None` if the builder has no planes attached.
-    pub fn build(self) -> Option<Dmabuf> {
+    pub fn build(mut self) -> Option<Dmabuf> {
         if self.internal.planes.is_empty() {
             return None;
         }
 
-        Some(Dmabuf(Arc::new(self.internal)))
+        self.internal.debug_id = DMABUF_DEBUG_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // Capture the creation path only for full-output-sized buffers — those are
+        // the residual leak; small surfaces/cursors would just be backtrace noise.
+        if (self.internal.size.w as i64) * (self.internal.size.h as i64) >= 1280 * 720 {
+            self.internal.created_at = dmabuf_creation_signature();
+        }
+        let inner = Arc::new(self.internal);
+        let clone_id = dmabuf_register_clone(&inner);
+        Some(Dmabuf(inner, clone_id))
     }
 }
 
@@ -194,6 +346,8 @@ impl Dmabuf {
     ) -> DmabufBuilder {
         DmabufBuilder {
             internal: DmabufInternal {
+                debug_id: 0,
+                created_at: String::new(),
                 planes: Vec::with_capacity(MAX_PLANES),
                 size: size.into(),
                 format,
@@ -245,6 +399,30 @@ impl Dmabuf {
     /// Create a weak reference to this dmabuf
     pub fn weak(&self) -> WeakDmabuf {
         WeakDmabuf(Arc::downgrade(&self.0))
+    }
+
+    /// VRAM-leak instrumentation: the unique id stamped at construction.
+    pub fn debug_id(&self) -> u64 {
+        self.0.debug_id
+    }
+
+    /// VRAM-leak instrumentation: strong-reference count of the underlying handle.
+    pub fn debug_strong_count(&self) -> usize {
+        Arc::strong_count(&self.0)
+    }
+
+    /// VRAM-leak instrumentation: compact creation-path signature (empty for
+    /// buffers below the full-output size threshold).
+    pub fn debug_created_at(&self) -> &str {
+        &self.0.created_at
+    }
+
+    /// VRAM-leak instrumentation: address of the shared `DmabufInternal`
+    /// allocation (the `Arc` data pointer), for locating the strong holder of a
+    /// leaked handle in a core dump (search memory for `ptr - 2*size_of::<usize>()`,
+    /// the `ArcInner` start that holders store).
+    pub fn debug_ptr(&self) -> usize {
+        Arc::as_ptr(&self.0) as usize
     }
 
     /// Presumably compatible device for buffer import
@@ -438,7 +616,10 @@ impl WeakDmabuf {
     /// Fails if no strong references exist anymore and the handle was already closed.
     #[inline]
     pub fn upgrade(&self) -> Option<Dmabuf> {
-        self.0.upgrade().map(Dmabuf)
+        self.0.upgrade().map(|inner| {
+            let clone_id = dmabuf_register_clone(&inner);
+            Dmabuf(inner, clone_id)
+        })
     }
 
     /// Returns true if there are not any strong references remaining

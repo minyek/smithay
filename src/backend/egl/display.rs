@@ -838,6 +838,8 @@ impl EGLDisplay {
             if image == ffi::egl::NO_IMAGE_KHR {
                 Err(Error::EGLImageCreationFailed)
             } else {
+                #[cfg(feature = "renderer_gl")]
+                crate::backend::renderer::gles::debug_counters::egl_image_created();
                 Ok(image)
             }
         }
@@ -1147,7 +1149,7 @@ impl EGLBufferReader {
             let out = [ffi::egl::WAYLAND_PLANE_WL as i32, i as i32, ffi::egl::NONE as i32];
 
             images.push({
-                wrap_egl_call_ptr(|| unsafe {
+                let image = wrap_egl_call_ptr(|| unsafe {
                     ffi::egl::CreateImageKHR(
                         **self.display,
                         ffi::egl::NO_CONTEXT,
@@ -1156,7 +1158,10 @@ impl EGLBufferReader {
                         out.as_ptr(),
                     )
                 })
-                .map_err(BufferAccessError::EGLImageCreationFailed)?
+                .map_err(BufferAccessError::EGLImageCreationFailed)?;
+                #[cfg(feature = "renderer_gl")]
+                crate::backend::renderer::gles::debug_counters::egl_image_created();
+                image
             });
         }
 
