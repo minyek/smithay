@@ -404,6 +404,10 @@ pub fn on_commit_buffer_handler<D: 'static>(surface: &WlSurface) {
                     {
                         state.reset();
                     }
+                    // The multigpu per-surface texture cache has no cleanup of its
+                    // own; free it here too.
+                    #[cfg(feature = "renderer_multi")]
+                    crate::backend::renderer::multigpu::clear_surface_textures(data);
                 });
             });
         }

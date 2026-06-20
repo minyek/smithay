@@ -1673,6 +1673,20 @@ struct MultiTextureInternal {
 //  Type erasure just forces us to do this instead.
 unsafe impl Send for MultiTextureInternal {}
 
+/// Free any cached `MultiRenderer` textures imported for `surface`.
+///
+/// The per-surface cache (`MultiTextureInternal` in the surface `data_map`)
+/// holds imported GPU textures and their `EGLImage`s but has no destruction
+/// cleanup of its own, so without this its textures outlive the surface —
+/// until the last `WlSurface` reference drops — pinning client buffers in
+/// GPU memory.
+#[cfg(feature = "wayland_frontend")]
+pub(crate) fn clear_surface_textures(states: &crate::wayland::compositor::SurfaceData) {
+    if let Some(texture) = states.data_map.get::<Arc<Mutex<MultiTextureInternal>>>() {
+        texture.lock().unwrap().textures.clear();
+    }
+}
+
 type DamageAnyTextureMappings = Vec<(Rectangle<i32, BufferCoords>, Box<dyn Any + 'static>)>;
 
 #[derive(Debug)]
