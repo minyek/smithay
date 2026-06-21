@@ -32,7 +32,9 @@ mod texture;
 mod uniform;
 mod version;
 
-pub use debug_counters::{VramCounters, debug_egl_image_sites, vram_counters};
+pub use debug_counters::{
+    VramCounters, debug_egl_image_sites, note_egl_image_destroyed, vram_counters,
+};
 pub use error::*;
 use format::*;
 pub use shaders::*;

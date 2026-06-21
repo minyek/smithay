@@ -74,6 +74,18 @@ pub(crate) fn egl_image_freed_on_import_error() {
     inc(&EGL_IMAGES_FREED_ON_IMPORT_ERROR);
 }
 
+/// Public hook for code that destroys an `EGLImage` outside the renderer's own
+/// cleanup queue — e.g. cosmic-comp's dmabuf-import validation, which creates an
+/// image with `create_image_from_dmabuf` (counted via `egl_image_created`) and
+/// destroys it immediately with a raw `DestroyImageKHR`. Without this the create
+/// is counted but the destroy is not, so `egl_images_created` drifts up forever
+/// (one per validated client buffer) and masquerades as a leak. Call this right
+/// after the raw destroy to keep the counters and allocation-site registry
+/// balanced.
+pub fn note_egl_image_destroyed(handle: usize) {
+    egl_image_destroyed(handle);
+}
+
 /// VRAM-leak instrumentation: per-`EGLImage` creation backtraces, keyed by the
 /// raw handle. An image created (`egl_image_created`) but never destroyed
 /// (`egl_image_destroyed`) leaves a surviving entry whose backtrace is the
