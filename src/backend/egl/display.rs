@@ -839,7 +839,7 @@ impl EGLDisplay {
                 Err(Error::EGLImageCreationFailed)
             } else {
                 #[cfg(feature = "renderer_gl")]
-                crate::backend::renderer::gles::debug_counters::egl_image_created();
+                crate::backend::renderer::gles::debug_counters::egl_image_created(image as usize);
                 Ok(image)
             }
         }
@@ -1160,7 +1160,7 @@ impl EGLBufferReader {
                 })
                 .map_err(BufferAccessError::EGLImageCreationFailed)?;
                 #[cfg(feature = "renderer_gl")]
-                crate::backend::renderer::gles::debug_counters::egl_image_created();
+                crate::backend::renderer::gles::debug_counters::egl_image_created(image as usize);
                 image
             });
         }

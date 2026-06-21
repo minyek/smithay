@@ -32,7 +32,7 @@ mod texture;
 mod uniform;
 mod version;
 
-pub use debug_counters::{VramCounters, vram_counters};
+pub use debug_counters::{VramCounters, debug_egl_image_sites, vram_counters};
 pub use error::*;
 use format::*;
 pub use shaders::*;
@@ -350,7 +350,7 @@ impl GlesCleanup {
                 },
                 CleanupResource::EGLImage(image) => unsafe {
                     debug_counters::drained_egl_image();
-                    debug_counters::egl_image_destroyed();
+                    debug_counters::egl_image_destroyed(image as usize);
                     ffi_egl::DestroyImageKHR(**egl.display().get_display_handle(), image);
                 },
                 CleanupResource::FramebufferObject(fbo) => unsafe {
@@ -1356,6 +1356,8 @@ impl ImportDma for GlesRenderer {
             let tex = match self.import_egl_image(image, is_external, None) {
                 Ok(tex) => tex,
                 Err(err) => {
+                    debug_counters::egl_image_destroyed(image as usize);
+                    debug_counters::egl_image_freed_on_import_error();
                     unsafe {
                         ffi_egl::DestroyImageKHR(**self.egl.display().get_display_handle(), image);
                     }

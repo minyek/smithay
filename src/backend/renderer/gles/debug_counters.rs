@@ -20,7 +20,10 @@
 //! ordering is correct here and keeps the instrumentation off the hot path's
 //! critical timing.
 
+use std::backtrace::Backtrace;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 macro_rules! counters {
     ($($name:ident),* $(,)?) => {
@@ -40,6 +43,12 @@ counters! {
 
     DRAINED_TEXTURE, DRAINED_FRAMEBUFFER, DRAINED_RENDERBUFFER,
     DRAINED_EGL_IMAGE, DRAINED_MAPPING, DRAINED_PROGRAM, DRAINED_SYNC,
+
+    // Diagnostic: `EGLImage`s reclaimed on `import_dmabuf`'s `import_egl_image`
+    // error path. `create_image_from_dmabuf` allocates the handle before the bind;
+    // when the bind fails the handle has no owning `GlesTexture`. This counts how
+    // often that path fired — a non-trivial value confirms it as a leak source.
+    EGL_IMAGES_FREED_ON_IMPORT_ERROR,
 }
 
 #[inline]
@@ -53,11 +62,70 @@ pub(super) fn texture_created() {
 pub(super) fn texture_destroyed() {
     inc(&TEXTURES_DESTROYED);
 }
-pub(crate) fn egl_image_created() {
+pub(crate) fn egl_image_created(handle: usize) {
     inc(&EGL_IMAGES_CREATED);
+    egl_image_register(handle);
 }
-pub(crate) fn egl_image_destroyed() {
+pub(crate) fn egl_image_destroyed(handle: usize) {
     inc(&EGL_IMAGES_DESTROYED);
+    egl_image_deregister(handle);
+}
+pub(crate) fn egl_image_freed_on_import_error() {
+    inc(&EGL_IMAGES_FREED_ON_IMPORT_ERROR);
+}
+
+/// VRAM-leak instrumentation: per-`EGLImage` creation backtraces, keyed by the
+/// raw handle. An image created (`egl_image_created`) but never destroyed
+/// (`egl_image_destroyed`) leaves a surviving entry whose backtrace is the
+/// allocation site of a leaked handle — the EGLImage analogue of the `Dmabuf`
+/// clone-site registry. Off unless `COSMIC_DMABUF_TRACE` is set, so default
+/// builds pay nothing.
+fn egl_image_trace_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("COSMIC_DMABUF_TRACE").is_some())
+}
+
+/// Live tracked `EGLImage`s: `handle -> creation backtrace`. One entry per live
+/// handle, so the surviving entries after a leak are exactly the orphaned images.
+/// The backtrace is an `Arc` so a census can snapshot cheaply and symbolise
+/// outside the lock.
+fn egl_image_registry() -> &'static Mutex<HashMap<usize, Arc<Backtrace>>> {
+    static REG: OnceLock<Mutex<HashMap<usize, Arc<Backtrace>>>> = OnceLock::new();
+    REG.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn egl_image_register(handle: usize) {
+    if !egl_image_trace_enabled() {
+        return;
+    }
+    let bt = Arc::new(Backtrace::force_capture());
+    if let Ok(mut reg) = egl_image_registry().lock() {
+        reg.insert(handle, bt);
+    }
+}
+
+fn egl_image_deregister(handle: usize) {
+    if !egl_image_trace_enabled() {
+        return;
+    }
+    if let Ok(mut reg) = egl_image_registry().lock() {
+        reg.remove(&handle);
+    }
+}
+
+/// VRAM-leak instrumentation: snapshot of every live tracked `EGLImage` as
+/// `(handle, backtrace)`. Empty unless `COSMIC_DMABUF_TRACE` is set. Backtraces
+/// are symbolised outside the registry lock so a census never stalls the import
+/// path on symbolisation.
+pub fn debug_egl_image_sites() -> Vec<(usize, String)> {
+    let entries: Vec<(usize, Arc<Backtrace>)> = match egl_image_registry().lock() {
+        Ok(reg) => reg.iter().map(|(handle, bt)| (*handle, bt.clone())).collect(),
+        Err(_) => return Vec::new(),
+    };
+    entries
+        .into_iter()
+        .map(|(handle, bt)| (handle, bt.to_string()))
+        .collect()
 }
 pub(super) fn renderbuffer_created() {
     inc(&RENDERBUFFERS_CREATED);
@@ -189,6 +257,10 @@ pub struct VramCounters {
     pub drained_program: u64,
     /// `CleanupResource::Sync` items drained.
     pub drained_sync: u64,
+
+    /// `EGLImage`s reclaimed on `import_dmabuf`'s `import_egl_image` error path
+    /// (see [`EGL_IMAGES_FREED_ON_IMPORT_ERROR`]).
+    pub egl_images_freed_on_import_error: u64,
 }
 
 /// Take a snapshot of the process-global GPU-object lifecycle counters.
@@ -224,5 +296,7 @@ pub fn vram_counters() -> VramCounters {
         drained_mapping: load(&DRAINED_MAPPING),
         drained_program: load(&DRAINED_PROGRAM),
         drained_sync: load(&DRAINED_SYNC),
+
+        egl_images_freed_on_import_error: load(&EGL_IMAGES_FREED_ON_IMPORT_ERROR),
     }
 }
