@@ -8,6 +8,7 @@ use crate::{
             GesturePinchEndEvent, GesturePinchUpdateEvent, GestureSwipeBeginEvent, GestureSwipeEndEvent,
             GestureSwipeUpdateEvent, MotionEvent, PointerTarget, RelativeMotionEvent,
         },
+        tablet::{TabletSeatHandler, tool::TabletToolTarget},
         touch::{FrameMarker, TouchTarget},
     },
     utils::{
@@ -16,8 +17,10 @@ use crate::{
     },
     wayland::{
         compositor::{self, CompositorHandler, RectangleKind, RegionAttributes, SurfaceAttributes},
+        pointer_constraints::PointerConstraintsHandler,
         seat::{WaylandFocus, keyboard::enter_internal},
     },
+    xwayland::xwm::MwmHints,
 };
 #[cfg(feature = "desktop")]
 use crate::{
@@ -25,8 +28,8 @@ use crate::{
     utils::Point,
 };
 
-use atomic_float::AtomicF64;
 use encoding_rs::WINDOWS_1252;
+use portable_atomic::AtomicF64;
 use std::{
     borrow::Cow,
     collections::HashSet,
@@ -91,10 +94,6 @@ pub enum PingError {
     #[error(transparent)]
     Connection(#[from] ConnectionError),
 }
-
-const MWM_HINTS_FLAGS_FIELD: usize = 0;
-const MWM_HINTS_DECORATIONS_FIELD: usize = 2;
-const MWM_HINTS_DECORATIONS: u32 = 1 << 1;
 
 const DEFAULT_SYNC_REQUEST_TIMEOUT: Duration = Duration::from_secs(1);
 // From http://fishsoup.net/misc/wm-spec-synchronization.html
@@ -162,7 +161,7 @@ pub(crate) struct SharedSurfaceState {
     normal_hints: Option<WmSizeHints>,
     transient_for: Option<X11Window>,
     pub(super) net_state: HashSet<Atom>,
-    motif_hints: Vec<u32>,
+    motif_hints: MwmHints,
     window_type: Vec<Atom>,
     pub(crate) opacity: Option<u32>,
     opaque_region: Option<RegionAttributes>,
@@ -367,7 +366,7 @@ impl X11Surface {
                 normal_hints: None,
                 transient_for: None,
                 net_state: HashSet::new(),
-                motif_hints: vec![0; 5],
+                motif_hints: MwmHints::default(),
                 window_type: Vec::new(),
                 opacity: None,
                 opaque_region: None,
@@ -1287,10 +1286,17 @@ impl X11Surface {
     /// Returns true if the window is client-side decorated
     pub fn is_decorated(&self) -> bool {
         let state = self.state.lock().unwrap();
-        if (state.motif_hints[MWM_HINTS_FLAGS_FIELD] & MWM_HINTS_DECORATIONS) != 0 {
-            return state.motif_hints[MWM_HINTS_DECORATIONS_FIELD] == 0;
-        }
-        false
+        state
+            .motif_hints
+            .decorations
+            .as_ref()
+            .is_some_and(|decorations| decorations.is_empty())
+    }
+
+    /// Returns the Motif WM hints set on the window.
+    pub fn motif_hints(&self) -> MwmHints {
+        let state = self.state.lock().unwrap();
+        state.motif_hints.clone()
     }
 
     /// Sets the window as maximized or not.
@@ -1667,12 +1673,10 @@ impl X11Surface {
             return Ok(());
         };
 
-        if hints.len() < 5 {
-            return Ok(());
+        if let Some(hints) = MwmHints::parse(&hints) {
+            let mut state = self.state.lock().unwrap();
+            state.motif_hints = hints;
         }
-
-        let mut state = self.state.lock().unwrap();
-        state.motif_hints = hints;
         Ok(())
     }
 
@@ -2238,7 +2242,7 @@ impl<D: SeatHandler + 'static> KeyboardTarget<D> for X11Surface {
     }
 }
 
-impl<D: SeatHandler + 'static> PointerTarget<D> for X11Surface {
+impl<D: SeatHandler + PointerConstraintsHandler + 'static> PointerTarget<D> for X11Surface {
     fn enter(&self, seat: &Seat<D>, data: &mut D, event: &MotionEvent) {
         if let Some(surface) = self.state.lock().unwrap().wl_surface.as_ref() {
             PointerTarget::enter(surface, seat, data, event);
@@ -2378,6 +2382,104 @@ impl<D: SeatHandler + CompositorHandler + 'static> TouchTarget<D> for X11Surface
             TouchTarget::last_frame(surface, seat, data)
         } else {
             None
+        }
+    }
+}
+
+impl<D: TabletSeatHandler + CompositorHandler + 'static> TabletToolTarget<D> for X11Surface {
+    fn proximity_in(
+        &self,
+        seat: &Seat<D>,
+        data: &mut D,
+        tool_descriptor: &crate::backend::input::TabletToolDescriptor,
+        tablet: &crate::input::tablet::Tablet,
+        serial: Serial,
+    ) {
+        if let Some(surface) = self.state.lock().unwrap().wl_surface.as_ref() {
+            TabletToolTarget::proximity_in(surface, seat, data, tool_descriptor, tablet, serial);
+        }
+    }
+
+    fn proximity_out(
+        &self,
+        seat: &Seat<D>,
+        data: &mut D,
+        tool_descriptor: &crate::backend::input::TabletToolDescriptor,
+    ) {
+        if let Some(surface) = self.state.lock().unwrap().wl_surface.as_ref() {
+            TabletToolTarget::proximity_out(surface, seat, data, tool_descriptor);
+        }
+    }
+
+    fn down(
+        &self,
+        seat: &Seat<D>,
+        data: &mut D,
+        tool_descriptor: &crate::backend::input::TabletToolDescriptor,
+        event: &crate::input::tablet::tool::DownEvent,
+    ) {
+        if let Some(surface) = self.state.lock().unwrap().wl_surface.as_ref() {
+            TabletToolTarget::down(surface, seat, data, tool_descriptor, event);
+        }
+    }
+
+    fn up(
+        &self,
+        seat: &Seat<D>,
+        data: &mut D,
+        tool_descriptor: &crate::backend::input::TabletToolDescriptor,
+        event: &crate::input::tablet::tool::UpEvent,
+    ) {
+        if let Some(surface) = self.state.lock().unwrap().wl_surface.as_ref() {
+            TabletToolTarget::up(surface, seat, data, tool_descriptor, event);
+        }
+    }
+
+    fn motion(
+        &self,
+        seat: &Seat<D>,
+        data: &mut D,
+        tool_descriptor: &crate::backend::input::TabletToolDescriptor,
+        event: &crate::input::tablet::tool::MotionEvent,
+    ) {
+        if let Some(surface) = self.state.lock().unwrap().wl_surface.as_ref() {
+            TabletToolTarget::motion(surface, seat, data, tool_descriptor, event);
+        }
+    }
+
+    fn button(
+        &self,
+        seat: &Seat<D>,
+        data: &mut D,
+        tool_descriptor: &crate::backend::input::TabletToolDescriptor,
+        event: &crate::input::tablet::tool::ButtonEvent,
+    ) {
+        if let Some(surface) = self.state.lock().unwrap().wl_surface.as_ref() {
+            TabletToolTarget::button(surface, seat, data, tool_descriptor, event);
+        }
+    }
+
+    fn axis(
+        &self,
+        seat: &Seat<D>,
+        data: &mut D,
+        tool_descriptor: &crate::backend::input::TabletToolDescriptor,
+        frame: crate::input::tablet::tool::AxisFrame,
+    ) {
+        if let Some(surface) = self.state.lock().unwrap().wl_surface.as_ref() {
+            TabletToolTarget::axis(surface, seat, data, tool_descriptor, frame);
+        }
+    }
+
+    fn frame(
+        &self,
+        seat: &Seat<D>,
+        data: &mut D,
+        tool_descriptor: &crate::backend::input::TabletToolDescriptor,
+        time: u32,
+    ) {
+        if let Some(surface) = self.state.lock().unwrap().wl_surface.as_ref() {
+            TabletToolTarget::frame(surface, seat, data, tool_descriptor, time);
         }
     }
 }

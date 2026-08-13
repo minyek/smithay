@@ -42,6 +42,7 @@
 //! #     }
 //! # }
 //! # use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
+//! # use smithay::wayland::pointer_constraints::PointerConstraintsHandler;
 //! # use smithay::input::{Seat, SeatState, SeatHandler, pointer::CursorImageStatus, dnd::DndGrabHandler};
 //! # use smithay::backend::input::KeyState;
 //! # use smithay::input::{
@@ -69,6 +70,7 @@
 //! #     fn focus_changed(&mut self, seat: &Seat<Self>, focused: Option<&Target>) {}
 //! #     fn cursor_image(&mut self, seat: &Seat<Self>, image: CursorImageStatus) {}
 //! # }
+//! # impl PointerConstraintsHandler for State {}
 //! # impl DndGrabHandler for State {}
 //! # impl DataDeviceHandler for State {
 //! #     fn data_device_state(&mut self) -> &mut DataDeviceState { unreachable!() }
@@ -143,8 +145,8 @@ use crate::{
         xwayland_shell::{self, XWaylandShellHandler},
     },
 };
-use atomic_float::AtomicF64;
 use calloop::{Interest, LoopHandle, Mode, PostAction, generic::Generic, ping};
+use portable_atomic::AtomicF64;
 use rustix::fs::OFlags;
 use std::{
     cell::RefCell,
@@ -167,6 +169,7 @@ pub use x11rb::protocol::xproto::Window as X11Window;
 use x11rb::{
     connection::Connection as _,
     errors::{ReplyError, ReplyOrIdError},
+    properties::{WmHints, WmHintsState},
     protocol::{
         Event,
         composite::{ConnectionExt as _, Redirect},
@@ -187,6 +190,8 @@ use x11rb::{
 };
 
 mod dnd;
+mod mwm;
+pub use self::mwm::*;
 pub mod settings;
 use settings::{NameError, Value, XSettings};
 mod selection;
@@ -1379,6 +1384,23 @@ impl X11Wm {
         Ok(())
     }
 
+    /// Removes settings from XSETTINGS.
+    pub fn remove_xsettings(&mut self, names: impl Iterator<Item = String>) -> Result<(), ConnectionError> {
+        let removed = names.fold(false, |any_removed, name| {
+            self.xsettings.remove(&name).is_some() | any_removed
+        });
+        if removed {
+            self.xsettings.update(&self.conn)?;
+        }
+        Ok(())
+    }
+
+    /// Clears all settings from XSETTINGS.
+    pub fn clear_xsettings(&mut self) -> Result<(), ConnectionError> {
+        self.xsettings.clear();
+        self.xsettings.update(&self.conn)
+    }
+
     /// Gets the current primary output as advertised by xrandr
     pub fn get_randr_primary_output(&self) -> Result<Option<String>, ReplyError> {
         let current_primary = self
@@ -1440,8 +1462,8 @@ impl X11Wm {
                     let cookie = self.conn.randr_set_output_primary(self.screen.root, output_xid)?;
                     self.sequences_to_ignore
                         .push(Reverse(cookie.sequence_number() as u16));
-                    return Ok(());
                 }
+                return Ok(());
             }
         }
 
@@ -1672,6 +1694,15 @@ where
                         }
                     }
 
+                    if let Ok(Some(hints)) = WmHints::get(&*conn, win)?.reply_unchecked() {
+                        let mut state = surface.state.lock().unwrap();
+                        if matches!(hints.initial_state, Some(WmHintsState::Iconic)) {
+                            state.net_state.insert(xwm.atoms._NET_WM_STATE_HIDDEN);
+                        } else {
+                            state.net_state.remove(&xwm.atoms._NET_WM_STATE_HIDDEN);
+                        }
+                    }
+
                     drop(_guard);
                     state.map_window_request(xwm_id, surface);
                 }
@@ -1855,6 +1886,13 @@ where
                         if let Some(frame) = state.mapped_onto.take() {
                             conn.destroy_window(frame)?;
                         }
+                        conn.change_property32(
+                            PropMode::REPLACE,
+                            n.window,
+                            xwm.atoms.WM_STATE,
+                            xwm.atoms.WM_STATE,
+                            &[0 /*WithdrawnState*/, 0 /*WINDOW_NONE*/],
+                        )?;
                     }
                 }
                 drop(_guard);
@@ -2033,12 +2071,12 @@ where
                         .reply_unchecked()?
                     {
                         let type_ = prop.type_;
-                        transfer.read_selection_prop(prop);
                         if type_ == xwm.atoms.INCR {
                             transfer.incr = true;
                             return Ok(());
-                        } else if let Some(token) = transfer.token.as_ref() {
-                            let _ = loop_handle.enable(token);
+                        } else if transfer.token.is_some() {
+                            transfer.read_selection_prop(prop);
+                            let _ = loop_handle.enable(transfer.token.as_ref().unwrap());
                         } else {
                             selection.incoming.remove(&n.requestor);
                         }

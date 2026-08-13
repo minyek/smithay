@@ -31,13 +31,16 @@ pub fn listen_eis(handle: &calloop::LoopHandle<'static, AnvilState<UdevData>>) {
                         let seat = connection.add_seat("default");
                         let _ = seat.add_keyboard("virtual keyboard", XkbConfig::default());
                         seat.add_pointer("virtual pointer");
-                        seat.add_pointer_absolute("virtual absolute pointer");
-                        seat.add_touch("virtual touch");
+                        seat.add_pointer_absolute("virtual absolute pointer", &[]);
+                        seat.add_touch("virtual touch", &[]);
                     }
                     EiInputEvent::Disconnected => {}
                     EiInputEvent::Event(event) => {
                         let dh = data.display_handle.clone();
                         data.process_input_event(&dh, event);
+                    }
+                    EiInputEvent::TextKeysym { .. } | EiInputEvent::TextUtf8 { .. } => {
+                        // Anvil doesn't add a text device to the libei seat
                     }
                 })
                 .unwrap();

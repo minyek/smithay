@@ -8,7 +8,7 @@
 //! - Raw OpenGL ES 2
 
 use crate::utils::{Buffer as BufferCoord, Physical, Point, Rectangle, Scale, Size, Transform, ids::id_gen};
-use cgmath::Matrix3;
+use glam::Affine2;
 use std::{
     any::TypeId,
     cmp::Ordering,
@@ -179,16 +179,16 @@ pub enum TextureFilter {
 impl Transform {
     /// A projection matrix to apply this transformation
     #[inline]
-    pub fn matrix(&self) -> Matrix3<f32> {
+    pub fn matrix(&self) -> Affine2 {
         match self {
-            Transform::Normal => Matrix3::new(1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0),
-            Transform::_90 => Matrix3::new(0.0, -1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0),
-            Transform::_180 => Matrix3::new(-1.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, 1.0),
-            Transform::_270 => Matrix3::new(0.0, 1.0, 0.0, -1.0, 0.0, 0.0, 0.0, 0.0, 1.0),
-            Transform::Flipped => Matrix3::new(-1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0),
-            Transform::Flipped90 => Matrix3::new(0.0, 1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0),
-            Transform::Flipped180 => Matrix3::new(1.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, 1.0),
-            Transform::Flipped270 => Matrix3::new(0.0, -1.0, 0.0, -1.0, 0.0, 0.0, 0.0, 0.0, 1.0),
+            Transform::Normal => Affine2::IDENTITY,
+            Transform::_90 => Affine2::from_cols_array(&[0.0, -1.0, 1.0, 0.0, 0.0, 0.0]),
+            Transform::_180 => Affine2::from_cols_array(&[-1.0, 0.0, 0.0, -1.0, 0.0, 0.0]),
+            Transform::_270 => Affine2::from_cols_array(&[0.0, 1.0, -1.0, 0.0, 0.0, 0.0]),
+            Transform::Flipped => Affine2::from_cols_array(&[-1.0, 0.0, 0.0, 1.0, 0.0, 0.0]),
+            Transform::Flipped90 => Affine2::from_cols_array(&[0.0, 1.0, 1.0, 0.0, 0.0, 0.0]),
+            Transform::Flipped180 => Affine2::from_cols_array(&[1.0, 0.0, 0.0, -1.0, 0.0, 0.0]),
+            Transform::Flipped270 => Affine2::from_cols_array(&[0.0, -1.0, -1.0, 0.0, 0.0, 0.0]),
         }
     }
 }

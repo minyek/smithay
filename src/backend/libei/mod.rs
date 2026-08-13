@@ -20,14 +20,15 @@
 //!                 let seat = connection.add_seat("default");
 //!                 let _ = seat.add_keyboard("virtual keyboard", XkbConfig::default());
 //!                 seat.add_pointer("virtual pointer");
-//!                 seat.add_pointer_absolute("virtual absolute pointer");
-//!                 seat.add_touch("virtual touch");
+//!                 seat.add_pointer_absolute("virtual absolute pointer", &[]);
+//!                 seat.add_touch("virtual touch", &[]);
 //!             }
 //!             EiInputEvent::Disconnected => {}
 //!             EiInputEvent::Event(event) => {
 //!                 // Pass input event to compositor's input event handling logic
 //!                 // ...
 //!             }
+//!             EiInputEvent::TextKeysym { .. } | EiInputEvent::TextUtf8 { .. } => {}
 //!         }
 //!     }).unwrap();
 //!     Ok(calloop::PostAction::Continue)
@@ -47,12 +48,12 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use crate::backend::input::InputEvent;
+use crate::backend::input::{InputEvent, KeyState};
 
 mod input;
 pub use input::ScrollEvent;
 mod seat;
-pub use seat::EiInputSeat;
+pub use seat::{EiInputSeat, EiRegion};
 
 /// An [`EventSource`] for receiving input from an EI sender context and
 /// converting to [`InputEvent`]s.
@@ -114,7 +115,8 @@ impl EiInputConnection {
                 | DeviceCapability::Keyboard
                 | DeviceCapability::Touch
                 | DeviceCapability::Scroll
-                | DeviceCapability::Button,
+                | DeviceCapability::Button
+                | DeviceCapability::Text,
         );
         let seat = EiInputSeat::new(self, seat, self.0.event_sender.clone());
         self.0.seats.lock().unwrap().push(seat.clone());
@@ -142,6 +144,20 @@ pub enum EiInputEvent {
     Disconnected,
     /// An input event has been received from the client.
     Event(InputEvent<EiInput>),
+    /// The client injected a keysym via the `ei_text` interface. Unlike [`InputEvent::Keyboard`]
+    /// (which carries a keycode), this is keymap-independent; the compositor is responsible for
+    /// turning the keysym into input.
+    TextKeysym {
+        /// The XKB keysym.
+        keysym: u32,
+        /// Whether the keysym is pressed or released.
+        state: KeyState,
+    },
+    /// The client injected UTF-8 text via the `ei_text` interface.
+    TextUtf8 {
+        /// The UTF-8 text.
+        text: String,
+    },
 }
 
 impl EventSource for EiInput {
@@ -204,12 +220,29 @@ impl EventSource for EiInput {
                         seat.bind(request.capabilities);
                     }
                 }
+                Ok(EisRequestSourceEvent::Request(EisRequest::TextKeysym(event))) => {
+                    let state = match event.state {
+                        eis::keyboard::KeyState::Press => KeyState::Pressed,
+                        eis::keyboard::KeyState::Released => KeyState::Released,
+                    };
+                    cb(
+                        EiInputEvent::TextKeysym {
+                            keysym: event.keysym,
+                            state,
+                        },
+                        connection,
+                    );
+                }
+                Ok(EisRequestSourceEvent::Request(EisRequest::TextUtf8(event))) => {
+                    cb(EiInputEvent::TextUtf8 { text: event.text }, connection);
+                }
                 Ok(EisRequestSourceEvent::Request(request)) => {
                     if let Some(input_event) = convert_request(request) {
                         cb(EiInputEvent::Event(input_event), connection);
                     }
                 }
                 Err(err) => {
+                    cb(EiInputEvent::Disconnected, connection);
                     tracing::error!("Libei client error: {}", err);
                     return Ok(PostAction::Remove);
                 }
@@ -266,8 +299,18 @@ fn convert_request(request: EisRequest) -> Option<InputEvent<EiInput>> {
         EisRequest::TouchMotion(event) => Some(InputEvent::TouchMotion { event }),
         EisRequest::TouchCancel(event) => Some(InputEvent::TouchCancel { event }),
         EisRequest::DeviceClosed(event) => Some(InputEvent::DeviceRemoved { device: event.device }),
-        EisRequest::Frame(_) => None,
-        // TODO: handle `TextKeysym`/`TextUtf8` once `add_text()` support is added.
+        // `ei_device.frame` is not touch-specific: it commits whatever the client has sent
+        // for that device. The capability check is sufficient here because reis only emits
+        // a frame for a device that had pending events of its own, and every device we
+        // create has a single capability. So a frame on a touch-capable device
+        // necessarily contains touch events. This would need revisiting if a device ever
+        // advertised `Touch` alongside another capability.
+        EisRequest::Frame(event) => event
+            .device
+            .has_capability(reis::request::DeviceCapability::Touch)
+            .then_some(InputEvent::TouchFrame { event }),
+        // `TextKeysym`/`TextUtf8` are surfaced as `EiInputEvent::TextKeysym`/`TextUtf8` directly,
+        // so they never reach here.
         EisRequest::TextKeysym(_)
         | EisRequest::TextUtf8(_)
         | EisRequest::Disconnect
