@@ -215,6 +215,15 @@ default implementations, which result in skipping the new functionality. As such
 
 `Output` now has `owns_xdg_output()` which allows you to match an XDG output protocol object with an `Output`.
 
+Added `Renderer::invalidate_caches`, which unconditionally drops all renderer-internal caches,
+including entries `Renderer::cleanup_texture_cache` retains while their source buffers are still
+alive.
+
+Added `GpuManager::cleanup_texture_cache` and `GpuManager::invalidate_caches`, which apply the
+corresponding `Renderer` method to every enumerated device. `GpuManager::invalidate_caches`
+additionally drops the buffers cached for copying between a render and a target node, which no
+`Renderer` owns.
+
 ### Bugfixes
 
 `SimpleCrtcMapper` (in `smithay-drm-extras`) now releases the CRTC reservation of any connector that
@@ -232,6 +241,12 @@ are emitted with a stale wl_output anymore.
 
 The XWayland WM implementation previously incorrectly prefixed large transfers from X11 windows with
 the four INCR bytes.
+
+`MultiRenderer::cleanup_texture_cache` now also cleans up the devices other than the render and
+target device. Buffers that cannot be imported on the render node directly are imported on their
+source device, so those devices accumulate cached imports that previously were never released.
+Cleanup is now also attempted on every device even if it fails on one of them, with every failure
+logged and the first error returned.
 
 ## 0.7.0
 
