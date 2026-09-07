@@ -1,5 +1,5 @@
 /// OpenGL Shaders
-use crate::backend::renderer::gles::{debug_counters, *};
+use crate::backend::renderer::gles::*;
 
 pub(in super::super) const VERTEX_SHADER: &str = include_str!("./texture.vert");
 pub(in super::super) const FRAGMENT_SHADER: &str = include_str!("./texture.frag");
