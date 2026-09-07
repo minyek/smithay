@@ -241,6 +241,16 @@ impl<A: GraphicsApi> GpuManager<A> {
         Ok(self.devices.iter())
     }
 
+    /// Observe existing renderer instances without applying pending topology changes.
+    pub fn debug_devices(&mut self) -> &mut [A::Device] {
+        &mut self.devices
+    }
+
+    /// Whether the API has topology changes awaiting enumeration.
+    pub fn debug_enumeration_pending(&self) -> bool {
+        self.api.needs_enumeration()
+    }
+
     /// Get all devices enumerated by the API.
     pub fn devices_mut(&mut self) -> Result<impl Iterator<Item = &mut A::Device>, A::Error> {
         if self.api.needs_enumeration() {

@@ -17,12 +17,12 @@ use std::{
     sync::{
         Arc, Mutex, RwLock, RwLockWriteGuard, TryLockError,
         atomic::{AtomicBool, AtomicPtr, Ordering},
-        mpsc::{self, Sender},
     },
 };
 use tracing::{Level, debug, error, info, info_span, instrument, span, span::EnteredSpan, trace, warn};
 
 pub(crate) mod debug_counters;
+mod debug_queue;
 pub mod element;
 mod error;
 pub mod format;
@@ -35,6 +35,7 @@ mod version;
 pub use debug_counters::{
     VramCounters, debug_egl_image_sites, note_egl_image_destroyed, vram_counters,
 };
+use debug_queue::Sender;
 pub use error::*;
 use format::*;
 pub use shaders::*;
@@ -156,7 +157,6 @@ impl GlesRenderbuffer {
 
 impl Drop for GlesRenderbufferInternal {
     fn drop(&mut self) {
-        debug_counters::queued_renderbuffer();
         let _ = self
             .destruction_callback_sender
             .send(CleanupResource::RenderbufferObject(self.rbo));
@@ -274,11 +274,9 @@ impl Drop for GlesTargetInternal<'_> {
                 destruction_callback_sender,
                 ..
             } => {
-                debug_counters::queued_framebuffer();
                 let _ = destruction_callback_sender.send(CleanupResource::FramebufferObject(*fbo));
             }
             GlesTargetInternal::Renderbuffer { buf, fbo, .. } => {
-                debug_counters::queued_framebuffer();
                 let _ = buf
                     .0
                     .destruction_callback_sender
@@ -316,13 +314,13 @@ pub enum Capability {
 /// destroying one renderer will not leak resources, but allow another renderer
 /// with a shared context to clean them up.
 struct GlesCleanup {
-    receiver: Mutex<mpsc::Receiver<CleanupResource>>,
-    sender: mpsc::Sender<CleanupResource>,
+    receiver: Mutex<debug_queue::Receiver<CleanupResource>>,
+    sender: Sender<CleanupResource>,
 }
 
 impl Default for GlesCleanup {
     fn default() -> Self {
-        let (sender, receiver) = mpsc::channel();
+        let (sender, receiver) = debug_queue::channel();
         Self {
             receiver: Mutex::new(receiver),
             sender,

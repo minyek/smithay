@@ -5,9 +5,10 @@
 //! driver owns the memory, not the process heap. These counters make that drift
 //! observable. Each GL object class the renderer allocates (textures, EGLImages,
 //! renderbuffers, GL buffer objects, framebuffers) gets a created/destroyed pair,
-//! and every deferred-destruction queue variant gets a queued/drained pair. A
-//! healthy renderer keeps `created - destroyed` and `queued - drained` bounded;
-//! unbounded growth in either localises the leak to a specific object class.
+//! and every deferred-destruction queue variant tracks submissions, explicit
+//! drains, and discarded requests. Outstanding requests are
+//! `queued - drained - discarded`. Discarding a request does not prove GL deletion;
+//! context retirement can release objects without an explicit deletion call.
 //!
 //! The counters are deliberately process-global rather than per-renderer or
 //! per-context: GL resources are freed lazily on whichever shared context runs
@@ -44,6 +45,14 @@ counters! {
     DRAINED_TEXTURE, DRAINED_FRAMEBUFFER, DRAINED_RENDERBUFFER,
     DRAINED_EGL_IMAGE, DRAINED_MAPPING, DRAINED_PROGRAM, DRAINED_SYNC,
 
+    DISCARDED_TEXTURE,
+    DISCARDED_FRAMEBUFFER,
+    DISCARDED_RENDERBUFFER,
+    DISCARDED_EGL_IMAGE,
+    DISCARDED_MAPPING,
+    DISCARDED_PROGRAM,
+    DISCARDED_SYNC,
+
     // Diagnostic: `EGLImage`s reclaimed on `import_dmabuf`'s `import_egl_image`
     // error path. `create_image_from_dmabuf` allocates the handle before the bind;
     // when the bind fails the handle has no owning `GlesTexture`. This counts how
@@ -54,6 +63,34 @@ counters! {
 #[inline]
 fn inc(counter: &AtomicU64) {
     counter.fetch_add(1, Ordering::Relaxed);
+}
+
+impl super::debug_queue::Accounting for super::CleanupResource {
+    fn queued(&self) {
+        use super::CleanupResource::*;
+        inc(match self {
+            Texture(_) => &QUEUED_TEXTURE,
+            FramebufferObject(_) => &QUEUED_FRAMEBUFFER,
+            RenderbufferObject(_) => &QUEUED_RENDERBUFFER,
+            EGLImage(_) => &QUEUED_EGL_IMAGE,
+            Mapping(_, _) => &QUEUED_MAPPING,
+            Program(_) => &QUEUED_PROGRAM,
+            Sync(_) => &QUEUED_SYNC,
+        });
+    }
+
+    fn discarded(&self) {
+        use super::CleanupResource::*;
+        inc(match self {
+            Texture(_) => &DISCARDED_TEXTURE,
+            FramebufferObject(_) => &DISCARDED_FRAMEBUFFER,
+            RenderbufferObject(_) => &DISCARDED_RENDERBUFFER,
+            EGLImage(_) => &DISCARDED_EGL_IMAGE,
+            Mapping(_, _) => &DISCARDED_MAPPING,
+            Program(_) => &DISCARDED_PROGRAM,
+            Sync(_) => &DISCARDED_SYNC,
+        });
+    }
 }
 
 pub(super) fn texture_created() {
@@ -158,28 +195,6 @@ pub(super) fn framebuffer_destroyed() {
     inc(&FRAMEBUFFERS_DESTROYED);
 }
 
-pub(super) fn queued_texture() {
-    inc(&QUEUED_TEXTURE);
-}
-pub(super) fn queued_framebuffer() {
-    inc(&QUEUED_FRAMEBUFFER);
-}
-pub(super) fn queued_renderbuffer() {
-    inc(&QUEUED_RENDERBUFFER);
-}
-pub(super) fn queued_egl_image() {
-    inc(&QUEUED_EGL_IMAGE);
-}
-pub(super) fn queued_mapping() {
-    inc(&QUEUED_MAPPING);
-}
-pub(super) fn queued_program() {
-    inc(&QUEUED_PROGRAM);
-}
-pub(super) fn queued_sync() {
-    inc(&QUEUED_SYNC);
-}
-
 pub(super) fn drained_texture() {
     inc(&DRAINED_TEXTURE);
 }
@@ -204,13 +219,11 @@ pub(super) fn drained_sync() {
 
 /// Snapshot of the process-global GPU-object lifecycle counters.
 ///
-/// Captured for leak hunting: a class whose `*_created` total keeps pulling ahead
-/// of its `*_destroyed` total, or a cleanup-queue variant whose `*_queued` total
-/// keeps pulling ahead of its `*_drained` total, is the leaking class. All fields
-/// are monotonic running totals across every GL context and thread in the
-/// process, so two snapshots taken over a window can be diffed to see which class
-/// drifted. The struct is `Copy`, so a snapshot is a stable, allocation-free
-/// value the caller can log or stash for a later diff.
+/// All fields are monotonic totals across contexts and threads. Outstanding
+/// cleanup requests are `queued - drained - discarded`. Discarded requests include
+/// sends to retired queues and pending entries dropped with their receiver.
+/// They do not count as explicit GL destruction. Creation/destruction differences
+/// therefore require separate interpretation when contexts have retired.
 ///
 /// Counts are reads of independent `Relaxed` atomics, so a snapshot is not a
 /// consistent instant across counters — a destroy may be observed before its
@@ -240,7 +253,7 @@ pub struct VramCounters {
     /// GL framebuffer-object names freed.
     pub framebuffers_destroyed: u64,
 
-    /// `CleanupResource::Texture` items pushed onto the deferred-destruction queue.
+    /// Texture cleanup submissions, including sends rejected by a retired receiver.
     pub queued_texture: u64,
     /// `CleanupResource::FramebufferObject` items queued.
     pub queued_framebuffer: u64,
@@ -269,6 +282,21 @@ pub struct VramCounters {
     pub drained_program: u64,
     /// `CleanupResource::Sync` items drained.
     pub drained_sync: u64,
+
+    /// Texture cleanup requests dropped without explicit GL deletion.
+    pub discarded_texture: u64,
+    /// Framebuffer cleanup requests dropped without explicit GL deletion.
+    pub discarded_framebuffer: u64,
+    /// Renderbuffer cleanup requests dropped without explicit GL deletion.
+    pub discarded_renderbuffer: u64,
+    /// EGLImage cleanup requests dropped without explicit GL deletion.
+    pub discarded_egl_image: u64,
+    /// Mapping cleanup requests dropped without explicit GL deletion.
+    pub discarded_mapping: u64,
+    /// Program cleanup requests dropped without explicit GL deletion.
+    pub discarded_program: u64,
+    /// Sync cleanup requests dropped without explicit GL deletion.
+    pub discarded_sync: u64,
 
     /// `EGLImage`s reclaimed on `import_dmabuf`'s `import_egl_image` error path
     /// (see [`EGL_IMAGES_FREED_ON_IMPORT_ERROR`]).
@@ -308,6 +336,14 @@ pub fn vram_counters() -> VramCounters {
         drained_mapping: load(&DRAINED_MAPPING),
         drained_program: load(&DRAINED_PROGRAM),
         drained_sync: load(&DRAINED_SYNC),
+
+        discarded_texture: load(&DISCARDED_TEXTURE),
+        discarded_framebuffer: load(&DISCARDED_FRAMEBUFFER),
+        discarded_renderbuffer: load(&DISCARDED_RENDERBUFFER),
+        discarded_egl_image: load(&DISCARDED_EGL_IMAGE),
+        discarded_mapping: load(&DISCARDED_MAPPING),
+        discarded_program: load(&DISCARDED_PROGRAM),
+        discarded_sync: load(&DISCARDED_SYNC),
 
         egl_images_freed_on_import_error: load(&EGL_IMAGES_FREED_ON_IMPORT_ERROR),
     }
