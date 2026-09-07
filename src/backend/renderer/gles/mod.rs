@@ -23,6 +23,7 @@ use tracing::{Level, debug, error, info, info_span, instrument, span, span::Ente
 
 pub(crate) mod debug_counters;
 mod debug_queue;
+mod debug_queue_tracker;
 pub mod element;
 mod error;
 pub mod format;
@@ -33,8 +34,10 @@ mod uniform;
 mod version;
 
 pub use debug_counters::{
-    VramCounters, debug_egl_image_sites, note_egl_image_destroyed, vram_counters,
+    VramCounters, VramQueueSnapshots, debug_egl_image_sites, note_egl_image_destroyed, vram_counters,
+    vram_queue_snapshots,
 };
+pub use debug_queue_tracker::QueueSnapshot;
 use debug_queue::Sender;
 pub use error::*;
 use format::*;
@@ -83,6 +86,7 @@ pub mod ffi {
     include!(concat!(env!("OUT_DIR"), "/gl_bindings.rs"));
 }
 
+#[derive(Clone, Copy)]
 enum CleanupResource {
     Texture(ffi::types::GLuint),
     FramebufferObject(ffi::types::GLuint),
@@ -341,8 +345,8 @@ impl GlesCleanup {
                 return;
             }
         };
-        for resource in receiver.try_iter() {
-            match resource {
+        for pending in receiver.try_iter() {
+            match *pending.resource() {
                 CleanupResource::Texture(texture) => unsafe {
                     debug_counters::drained_texture();
                     debug_counters::texture_destroyed();

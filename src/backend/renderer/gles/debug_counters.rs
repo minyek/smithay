@@ -25,6 +25,60 @@ use std::backtrace::Backtrace;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use super::debug_queue_tracker::{QueueSnapshot, QueueTracker};
+
+static TEXTURE_QUEUE: QueueTracker = QueueTracker::new();
+static FRAMEBUFFER_QUEUE: QueueTracker = QueueTracker::new();
+static RENDERBUFFER_QUEUE: QueueTracker = QueueTracker::new();
+static EGL_IMAGE_QUEUE: QueueTracker = QueueTracker::new();
+static MAPPING_QUEUE: QueueTracker = QueueTracker::new();
+static PROGRAM_QUEUE: QueueTracker = QueueTracker::new();
+static SYNC_QUEUE: QueueTracker = QueueTracker::new();
+
+fn queue_tracker(resource: &super::CleanupResource) -> &'static QueueTracker {
+    use super::CleanupResource::*;
+    match resource {
+        Texture(_) => &TEXTURE_QUEUE,
+        FramebufferObject(_) => &FRAMEBUFFER_QUEUE,
+        RenderbufferObject(_) => &RENDERBUFFER_QUEUE,
+        EGLImage(_) => &EGL_IMAGE_QUEUE,
+        Mapping(_, _) => &MAPPING_QUEUE,
+        Program(_) => &PROGRAM_QUEUE,
+        Sync(_) => &SYNC_QUEUE,
+    }
+}
+
+/// Outstanding cleanup requests across all contexts, grouped by resource class.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct VramQueueSnapshots {
+    /// Texture cleanup submission and outstanding sequence state.
+    pub texture: QueueSnapshot,
+    /// Framebuffer cleanup submission and outstanding sequence state.
+    pub framebuffer: QueueSnapshot,
+    /// Renderbuffer cleanup submission and outstanding sequence state.
+    pub renderbuffer: QueueSnapshot,
+    /// EGLImage cleanup submission and outstanding sequence state.
+    pub egl_image: QueueSnapshot,
+    /// Mapping cleanup submission and outstanding sequence state.
+    pub mapping: QueueSnapshot,
+    /// Program cleanup submission and outstanding sequence state.
+    pub program: QueueSnapshot,
+    /// Sync cleanup submission and outstanding sequence state.
+    pub sync: QueueSnapshot,
+}
+
+/// Snapshot each resource class atomically with respect to enqueue and completion.
+pub fn vram_queue_snapshots() -> VramQueueSnapshots {
+    VramQueueSnapshots {
+        texture: TEXTURE_QUEUE.snapshot(),
+        framebuffer: FRAMEBUFFER_QUEUE.snapshot(),
+        renderbuffer: RENDERBUFFER_QUEUE.snapshot(),
+        egl_image: EGL_IMAGE_QUEUE.snapshot(),
+        mapping: MAPPING_QUEUE.snapshot(),
+        program: PROGRAM_QUEUE.snapshot(),
+        sync: SYNC_QUEUE.snapshot(),
+    }
+}
 
 macro_rules! counters {
     ($($name:ident),* $(,)?) => {
@@ -66,7 +120,7 @@ fn inc(counter: &AtomicU64) {
 }
 
 impl super::debug_queue::Accounting for super::CleanupResource {
-    fn queued(&self) {
+    fn queued(&self) -> u64 {
         use super::CleanupResource::*;
         inc(match self {
             Texture(_) => &QUEUED_TEXTURE,
@@ -77,6 +131,7 @@ impl super::debug_queue::Accounting for super::CleanupResource {
             Program(_) => &QUEUED_PROGRAM,
             Sync(_) => &QUEUED_SYNC,
         });
+        queue_tracker(self).submit()
     }
 
     fn discarded(&self) {
@@ -90,6 +145,10 @@ impl super::debug_queue::Accounting for super::CleanupResource {
             Program(_) => &DISCARDED_PROGRAM,
             Sync(_) => &DISCARDED_SYNC,
         });
+    }
+
+    fn finished(&self, sequence: u64) {
+        queue_tracker(self).complete(sequence);
     }
 }
 
